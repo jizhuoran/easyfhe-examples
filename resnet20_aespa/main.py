@@ -1,19 +1,16 @@
 import argparse
 import os
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
-from termcolor import colored
 import easyfhe as torch
 import easyfhe.bs.openfhe as bs
 import easyfhe.fhe as fhe
-from .cli import parse_rotation_key_limb_limits
-from .formatting import format_accuracy, format_bytes, format_seconds
 from .model import AespaRuntime, encrypt_input, infer_encrypted
-from .weight_pack import WeightPack
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_DATASET_PATH = SCRIPT_DIR / "data" / "cifar10" / "test_batch.npz"
@@ -22,6 +19,8 @@ WEIGHTS_PATH = os.environ.get(
     "EASYFHE_RESNET20_AESPA_WEIGHTS",
     str(SCRIPT_DIR / "resnet20_aespa_weights.npz"),
 )
+WARMUP_ITERS = 1
+WEIGHT_CACHE_RESERVED_GB = 24.0
 
 
 @dataclass(frozen=True)
@@ -72,7 +71,7 @@ def _parse_args():
     parser.add_argument(
         "--bootstrap-strategy",
         choices=("double_hoist", "normal_giant", "normal_bsgs"),
-        default=os.environ.get("EASYFHE_BOOTSTRAP_STRATEGY", "double_hoist"),
+        default=os.environ.get("EASYFHE_BOOTSTRAP_STRATEGY", "normal_giant"),
     )
     parser.add_argument(
         "--bootstrap-mode",
@@ -94,10 +93,98 @@ def _optional_float_env(name):
     return float(value)
 
 
+def _selected_cuda_device():
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visible:
+        return visible.split(",", 1)[0].strip()
+    return "0"
+
+
+def _default_weight_cache_limit_gb(device):
+    if device != "cuda":
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.total",
+                "--format=csv,noheader,nounits",
+                "-i",
+                _selected_cuda_device(),
+            ],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        total_mib = float(result.stdout.strip().splitlines()[0])
+    except (OSError, subprocess.CalledProcessError, IndexError, ValueError):
+        return None
+    return max(total_mib / 1024.0 - WEIGHT_CACHE_RESERVED_GB, 0.0)
+
+
+def _parse_rotation_key_limb_limits(values):
+    limits = {}
+    for value in values or ():
+        try:
+            rotation, limbs = str(value).split(":", 1)
+            limits[int(rotation)] = int(limbs)
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid --rot-key-limb-limit {value!r}; expected ROT:LIMBS"
+            ) from exc
+    return limits
+
+
+def _format_accuracy(correct, total):
+    percent = 100.0 * correct / total if total else 0.0
+    return f"{correct}/{total} ({percent:.2f}%)"
+
+
+def _format_bytes(num_bytes):
+    units = ("B", "KiB", "MiB", "GiB")
+    value = float(num_bytes)
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            return f"{value:.1f}{unit}" if unit != "B" else f"{int(value)}B"
+        value /= 1024.0
+
+
+def _format_seconds(seconds):
+    return f"{seconds:.3f}s"
+
+
+def _load_weights(config):
+    weight_path = Path(config.weights_path)
+    if not weight_path.exists():
+        raise ValueError(f"Weight npz {weight_path} does not exist!")
+    with np.load(weight_path) as weights:
+        scalars = {
+            name: float(np.asarray(weights[name]))
+            for name in weights.files
+            if name.startswith("scale.")
+        }
+        vectors = {
+            name: np.asarray(weights[name], dtype=np.double)
+            for name in weights.files
+            if not name.startswith("scale.")
+        }
+    return fhe.ConstantBundle(
+        scalars=scalars,
+        vectors=vectors,
+        cache_mode=config.weight_cache_mode,
+        plain_cache_limit_gb=config.weight_plain_cache_limit_gb,
+        plain_cache_policy=config.weight_plain_cache_policy,
+    )
+
+
 def build_config(args):
     secret_key_dist = str(
         getattr(args, "secret_key_dist", os.environ.get("EASYFHE_SECRET_KEY_DIST", "SPARSE_TERNARY"))
     ).upper()
+    weight_plain_cache_limit_gb = _optional_float_env("EASYFHE_WEIGHT_PLAIN_CACHE_GB")
+    if weight_plain_cache_limit_gb is None:
+        weight_plain_cache_limit_gb = _default_weight_cache_limit_gb(args.device)
     return AespaConfig(
         total=args.total,
         dataset_path=DATASET_PATH,
@@ -118,7 +205,7 @@ def build_config(args):
         bootstrap_strategy=getattr(
             args,
             "bootstrap_strategy",
-            os.environ.get("EASYFHE_BOOTSTRAP_STRATEGY", "double_hoist"),
+            os.environ.get("EASYFHE_BOOTSTRAP_STRATEGY", "normal_giant"),
         ),
         bootstrap_mode=getattr(
             args,
@@ -129,9 +216,9 @@ def build_config(args):
         scale_mode="fixed",
         rescale_policy="manual",
         device=args.device,
-        weight_cache_mode=os.environ.get("EASYFHE_WEIGHT_CACHE_MODE", "plain"),
-        weight_plain_cache_limit_gb=_optional_float_env("EASYFHE_WEIGHT_PLAIN_CACHE_GB"),
-        weight_plain_cache_policy=os.environ.get("EASYFHE_WEIGHT_PLAIN_CACHE_POLICY", "first_fit"),
+        weight_cache_mode=os.environ.get("EASYFHE_WEIGHT_CACHE_MODE", "mix"),
+        weight_plain_cache_limit_gb=weight_plain_cache_limit_gb,
+        weight_plain_cache_policy=os.environ.get("EASYFHE_WEIGHT_PLAIN_CACHE_POLICY", "small_first"),
     )
 
 
@@ -179,19 +266,16 @@ def _print_time_series(label, times):
     avg = sum(times) / len(times)
     print(
         f"{label}:",
-        f"avg={format_seconds(avg)}",
-        f"min={format_seconds(min(times))}",
-        f"max={format_seconds(max(times))}",
+        f"avg={_format_seconds(avg)}",
+        f"min={_format_seconds(min(times))}",
+        f"max={_format_seconds(max(times))}",
     )
-    if len(times) > 1:
-        warm_avg = sum(times[1:]) / (len(times) - 1)
-        print(f"{label} excluding first image: avg={format_seconds(warm_avg)}")
 
 
 def _print_timing_summary(encrypt_times, infer_times, correct, total):
     print("\n================ dataset summary ================")
-    print(f"accuracy: {format_accuracy(correct, total)}")
-    print(f"e2e no encrypt/decrypt: {format_seconds(sum(infer_times))}")
+    print(f"accuracy: {_format_accuracy(correct, total)}")
+    print(f"e2e no encrypt/decrypt: {_format_seconds(sum(infer_times))}")
     _print_time_series("encrypt time", encrypt_times)
     _print_time_series("inference time", infer_times)
 
@@ -204,10 +288,10 @@ def _print_weight_cache_summary(weights):
         "weight cache:",
         f"mode={info['mode']}",
         f"plain_policy={info.get('plain_cache_policy', 'first_fit')}",
-        f"middle={info['middle_entries']}({format_bytes(info['middle_bytes'])})",
-        f"plain={info['plain_entries']}({format_bytes(info['plain_bytes'])})",
-        f"scalar={info.get('scalar_entries', 0)}({format_bytes(info.get('scalar_bytes', 0))})",
-        f"total={format_bytes(info.get('total_bytes', 0))}",
+        f"middle={info['middle_entries']}({_format_bytes(info['middle_bytes'])})",
+        f"plain={info['plain_entries']}({_format_bytes(info['plain_bytes'])})",
+        f"scalar={info.get('scalar_entries', 0)}({_format_bytes(info.get('scalar_bytes', 0))})",
+        f"total={_format_bytes(info.get('total_bytes', 0))}",
         f"plain_limit={_format_optional_bytes(info.get('plain_cache_limit_bytes'))}",
         f"plain_remaining={_format_optional_bytes(info.get('plain_cache_remaining_bytes'))}",
         f"plain_skips={info.get('plain_cache_skips', 0)}",
@@ -222,7 +306,45 @@ def _print_weight_cache_summary(weights):
 
 
 def _format_optional_bytes(num_bytes):
-    return "unlimited" if num_bytes is None else format_bytes(num_bytes)
+    return "unlimited" if num_bytes is None else _format_bytes(num_bytes)
+
+
+def _run_sample(rt, dataset, index, *, timed):
+    sample_index = index % len(dataset)
+    image_vector, label = dataset[sample_index]
+
+    if timed:
+        _sync_device(rt)
+        encrypt_start = time.perf_counter()
+        input_cipher = encrypt_input(image_vector, rt)
+        _sync_device(rt)
+        encrypt_seconds = time.perf_counter() - encrypt_start
+
+        infer_start = time.perf_counter()
+        final_res = infer_encrypted(input_cipher, rt)
+        _sync_device(rt)
+        infer_seconds = time.perf_counter() - infer_start
+
+        decrypt_start = time.perf_counter()
+        logits, max_element_idx = _decrypt_prediction(final_res, rt)
+        decrypt_seconds = time.perf_counter() - decrypt_start
+    else:
+        _sync_device(rt)
+        input_cipher = encrypt_input(image_vector, rt)
+        final_res = infer_encrypted(input_cipher, rt)
+        _sync_device(rt)
+        logits, max_element_idx = _decrypt_prediction(final_res, rt)
+        encrypt_seconds = infer_seconds = decrypt_seconds = None
+
+    return {
+        "index": sample_index,
+        "label": label,
+        "logits": logits,
+        "prediction": max_element_idx,
+        "encrypt_seconds": encrypt_seconds,
+        "infer_seconds": infer_seconds,
+        "decrypt_seconds": decrypt_seconds,
+    }
 
 
 def run_dataset(rt):
@@ -233,49 +355,43 @@ def run_dataset(rt):
     correct = 0
 
     print("\n================ run dataset ================")
-    print(f"images: {total}")
+    print(f"warmup iterations: {WARMUP_ITERS}")
+    print(f"measured iterations: {total}")
     print(f"device: {rt.ctx.device}")
 
+    for i in range(WARMUP_ITERS):
+        result = _run_sample(rt, dataset, i, timed=False)
+        is_correct = result["label"] == result["prediction"]
+        status = "correct" if is_correct else "wrong"
+        print(
+            f"[warmup {i + 1}/{WARMUP_ITERS}] index={result['index']} "
+            f"label={result['label']} prediction={result['prediction']} {status}"
+        )
+
     for i in range(total):
-        image_vector, label = dataset[i]
-        index = i
+        result = _run_sample(rt, dataset, i, timed=True)
+        encrypt_times.append(result["encrypt_seconds"])
+        infer_times.append(result["infer_seconds"])
 
-        _sync_device(rt)
-        encrypt_start = time.perf_counter()
-        input_cipher = encrypt_input(image_vector, rt)
-        _sync_device(rt)
-        encrypt_seconds = time.perf_counter() - encrypt_start
-        encrypt_times.append(encrypt_seconds)
-
-        infer_start = time.perf_counter()
-        final_res = infer_encrypted(input_cipher, rt)
-        _sync_device(rt)
-        infer_seconds = time.perf_counter() - infer_start
-        infer_times.append(infer_seconds)
-
-        decrypt_start = time.perf_counter()
-        logits, max_element_idx = _decrypt_prediction(final_res, rt)
-        decrypt_seconds = time.perf_counter() - decrypt_start
-
-        is_correct = label == max_element_idx
+        is_correct = result["label"] == result["prediction"]
         if is_correct:
             correct += 1
-        status = colored("correct", "green") if is_correct else colored("wrong", "red")
+        status = "correct" if is_correct else "wrong"
 
         print(
-            f"[{i + 1}/{total}] index={index} label={label} "
-            f"prediction={max_element_idx} {status}"
+            f"[{i + 1}/{total}] index={result['index']} label={result['label']} "
+            f"prediction={result['prediction']} {status}"
         )
         print(
             "    "
-            f"encrypt={format_seconds(encrypt_seconds)} "
-            f"infer={format_seconds(infer_seconds)} "
-            f"decrypt={format_seconds(decrypt_seconds)} "
-            f"e2e_no_encrypt_decrypt={format_seconds(infer_seconds)} "
-            f"accuracy={format_accuracy(correct, i + 1)}"
+            f"encrypt={_format_seconds(result['encrypt_seconds'])} "
+            f"infer={_format_seconds(result['infer_seconds'])} "
+            f"decrypt={_format_seconds(result['decrypt_seconds'])} "
+            f"e2e_no_encrypt_decrypt={_format_seconds(result['infer_seconds'])} "
+            f"accuracy={_format_accuracy(correct, i + 1)}"
         )
-        if logits is not None:
-            print("    logits=", np.array2string(logits, precision=6, separator=", "))
+        if result["logits"] is not None:
+            print("    logits=", np.array2string(result["logits"], precision=6, separator=", "))
 
     _print_timing_summary(encrypt_times, infer_times, correct, total)
     _print_weight_cache_summary(rt.weights)
@@ -313,7 +429,7 @@ def resnet20(config=None, args=None):
             rotations=rotations,
             auto_load_keys=args.auto_load_keys,
             rotation_random_mode=str(args.rotation_random_mode),
-            rotation_key_limb_limits=parse_rotation_key_limb_limits(args.rot_key_limb_limit),
+            rotation_key_limb_limits=_parse_rotation_key_limb_limits(args.rot_key_limb_limit),
         ),
         device=config.device,
     )
@@ -328,12 +444,7 @@ def resnet20(config=None, args=None):
         )
         bootstrap_material[int(log_bs_slots)] = (constants, plan)
     print("cryptoContext: ", cryptoContext)
-    weights = WeightPack.from_npz(
-        config.weights_path,
-        cache_mode=config.weight_cache_mode,
-        plain_cache_limit_gb=config.weight_plain_cache_limit_gb,
-        plain_cache_policy=config.weight_plain_cache_policy,
-    )
+    weights = _load_weights(config)
     print("weights loaded:", len(weights))
 
     run_dataset(AespaRuntime(cryptoContext, client, weights, config, bootstrap_material))

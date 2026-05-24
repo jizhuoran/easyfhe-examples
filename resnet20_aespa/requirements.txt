@@ -1,3 +1,2 @@
 easyfhe
 numpy
-termcolor

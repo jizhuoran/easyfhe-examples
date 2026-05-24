@@ -2,8 +2,6 @@ import math
 
 import easyfhe.fhe as fhe
 
-from .weight_pack import fold_slots_mask_name
-
 __all__ = [
     "broadcast_slot_sum",
     "downsample1024to256",
@@ -125,7 +123,7 @@ def _fold_merged_downsample_halves(cipher, cryptoContext, weights):
     half_slots = cipher.slots // 2
     target_slots = half_slots // 4
     mask = weights.plaintext(
-        fold_slots_mask_name(cipher.slots, target_slots),
+        _fold_slots_mask_name(cipher.slots, target_slots),
         cryptoContext.L - cipher.state.cur_limbs,
         cipher.slots,
         cryptoContext,
@@ -199,12 +197,16 @@ def _fold_quarters(cipher, cryptoContext, *, quarter_slots=None):
 def _fold_downsample_slots(channels, cryptoContext, weights):
     target_slots = channels.slots // 4
     mask = weights.plaintext(
-        fold_slots_mask_name(channels.slots, target_slots),
+        _fold_slots_mask_name(channels.slots, target_slots),
         cryptoContext.L - channels.state.cur_limbs,
         channels.slots,
         cryptoContext,
     )
     return fhe.fold_slots(channels, target_slots, cryptoContext, mask=mask)
+
+
+def _fold_slots_mask_name(source_slots, target_slots):
+    return f"fold_slots_mask_{int(source_slots)}to{int(target_slots)}"
 
 
 # Validation

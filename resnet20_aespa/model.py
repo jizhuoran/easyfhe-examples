@@ -17,14 +17,13 @@ from .ops import (
     initial_conv3x3,
     pointwise_conv,
 )
-from .weight_pack import WeightPack
 
 
 @dataclass
 class AespaRuntime:
     ctx: object
     client: object
-    weights: WeightPack
+    weights: object
     config: object
     bootstrap_material: dict[int, tuple[object, object]]
 

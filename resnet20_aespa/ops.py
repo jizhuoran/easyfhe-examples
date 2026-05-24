@@ -23,6 +23,12 @@ def _conv3x3_offsets(img_width, padding):
     ]
 
 
+def _scale_value(weights, scale):
+    if not isinstance(scale, str):
+        return scale
+    return weights._scalar_value(scale)
+
+
 def conv3x3(
     input,
     kernel_group,
@@ -42,7 +48,7 @@ def conv3x3(
         cryptoContext.L - input.state.cur_limbs,
         input.slots,
         cryptoContext,
-        weights.scalar_value(scale) if isinstance(scale, str) else scale,
+        _scale_value(weights, scale),
     )
     group_size = int(group_size)
     final_rotate = rot_offset if final_rotate is None else int(final_rotate)
@@ -77,7 +83,7 @@ def initial_conv3x3(
         cryptoContext.L - rotations.state.cur_limbs,
         rotations.slots,
         cryptoContext,
-        weights.scalar_value(scale) if isinstance(scale, str) else scale,
+        _scale_value(weights, scale),
     )
     partial_sums = fhe.grouped_pairwise_mac(
         rotations,
@@ -129,7 +135,7 @@ def pointwise_conv(
         cryptoContext.L - input.state.cur_limbs,
         input.slots,
         cryptoContext,
-        weights.scalar_value(scale) if isinstance(scale, str) else scale,
+        _scale_value(weights, scale),
     )
     group_size = plaintexts.batch_size if group_size is None else int(group_size)
     final_rotate = rot_offset if final_rotate is None else int(final_rotate)
@@ -143,7 +149,7 @@ def pointwise_conv(
         cryptoContext.L - finalsum.state.cur_limbs,
         finalsum.slots,
         cryptoContext,
-        weights.scalar_value(scale) if isinstance(scale, str) else scale,
+        _scale_value(weights, scale),
     )
     return fhe.homo_add_pt(finalsum, bias, cryptoContext)
 
@@ -155,7 +161,7 @@ def aespa_nonlinear(x, prefix, cryptoContext, weights, scale=1):
         cryptoContext.L - x.state.cur_limbs,
         x.slots,
         cryptoContext,
-        weights.scalar_value(scale) if isinstance(scale, str) else scale,
+        _scale_value(weights, scale),
     )
     shifted = fhe.homo_add_pt(x, n1, cryptoContext)
     out_cur_limbs = shifted.state.cur_limbs - 1
@@ -164,7 +170,7 @@ def aespa_nonlinear(x, prefix, cryptoContext, weights, scale=1):
         cryptoContext.L - out_cur_limbs,
         shifted.slots,
         cryptoContext,
-        weights.scalar_value(scale) if isinstance(scale, str) else scale,
+        _scale_value(weights, scale),
     )
     return fhe.homo_mul_relin_rescale_add_pt(shifted, shifted, n2, cryptoContext)
 
@@ -181,6 +187,6 @@ def aespa_add_shortcut(conv_out, shortcut, prefix, cryptoContext, weights, scale
         cryptoContext.L - shortcut.state.cur_limbs,
         shortcut.slots,
         cryptoContext,
-        weights.scalar_value(scale) if isinstance(scale, str) else scale,
+        _scale_value(weights, scale),
     )
     return fhe.homo_add(conv_out, fhe.homo_mul_pt(shortcut, a2, cryptoContext), cryptoContext)
