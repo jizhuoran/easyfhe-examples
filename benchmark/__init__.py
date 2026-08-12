@@ -1,1 +1,1 @@
-"""EasyFHE benchmark helpers and entrypoints."""
+"""Canonical EasyFHE u64 latency benchmark."""

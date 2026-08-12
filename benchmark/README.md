@@ -1,119 +1,32 @@
-# EasyFHE Benchmark
+# Canonical u64 operation benchmark
 
-This directory contains the EasyFHE latency benchmark pipeline. It runs real
-EasyFHE operations, writes JSON timing artifacts, and exports simulator-facing
-CSV tables.
+This example measures a small, fixed set of representative public EasyFHE
+operations on CUDA:
 
-## Entry Points
+- encryption and decryption;
+- ciphertext addition;
+- plaintext and ciphertext multiplication followed by one u64 rescale;
+- rotation; and
+- full-slot complex bootstrapping.
+
+It deliberately is not a parameter sweep or simulator-data pipeline. One
+fixed-scale u64 context is planned through `BootstrapSpec` and
+`bs.requirements`, every operation receives independent immutable inputs, and
+setup/key generation is outside the reported timings.
 
 Run from the repository root:
 
 ```bash
-python -m benchmark.cli --preset full-pipeline --dry-run
+PYTHONPATH=/path/to/EasyFHE-u64:. \
+python -m benchmark.main --warmup 2 --runs 10
 ```
 
-Compatibility wrapper:
+Warmup is synchronized and excluded independently for every operation. Each
+reported result is decrypted after measurement and checked against its clear
+NumPy result; non-finite values or excessive error stop the benchmark.
 
-```bash
-bash benchmark/run_all_profiling.sh
-```
-
-Available presets:
-
-- `bootstrap-profiling`
-- `full-profiling`
-- `full-pipeline`
-
-## What It Does
-
-- `timed_harness.py` measures foundational ops directly. Supported tuples
-  produce timing rows; locally invalid tuples are reported as `unsupported`;
-  exceptions are reported as `failed`.
-- `bootstrap-profiling` is a thin CLI alias for the bucketed bootstrap runner.
-- `run_bootstrap_bucketed_profiling.py` profiles bootstrap by reusing one
-  context per `(dnum, slots, level_budget)` bucket.
-- `tools/export_basic_ops_report_and_csv.py` exports foundational op timings.
-- `tools/update_bootstrap_rows_in_csv.py` merges bootstrap timings into the CSV.
-
-The exported CSV schema is:
-
-```text
-op, accelerator, N, cur_limbs, target_limbs, dnum, slots, level_budget_0, level_budget_1, latency_us
-```
-
-## Execution Order
-
-`full-pipeline` runs:
-
-1. `full-profiling` for foundational ops.
-2. foundational CSV export.
-3. bucketed bootstrap profiling.
-4. optional batched foundational export and bootstrap merge.
-
-Foundational ops currently run op-major. Bootstrap runs bucket-major:
-
-```text
-for dnum:
-  for logbs:
-    for level_budget:
-      load one context/key bucket
-      for target_limbs:
-        profile the pending cases
-```
-
-## Defaults
-
-Output files are written under:
-
-```text
-benchmark/data/
-```
-
-Context cache defaults to:
-
-```text
-benchmark/data/context_store/
-```
-
-The full pipeline uses `CONTEXT_CACHE_MODE=transient` by default in the shell
-wrapper, so generated contexts are reused within a run and then cleaned unless
-`KEEP_CONTEXT_CACHE=1` is set.
-
-Profiling is resumable by default. Each timed JSON contains a stable
-`case_manifest`, a `case_id` for every result, and resume metadata. If a run is
-interrupted, rerun the same command and completed `ok`, `unsupported`, and
-`failed` cases are skipped. Use `--rerun-failed` to retry failed cases, or
-`--no-resume` to ignore existing outputs and measure everything again.
-
-Bucketed bootstrap profiling also writes:
-
-```text
-benchmark/data/bootstrap_bucketed_fullscan/case_manifest.json
-```
-
-## Useful Overrides
-
-```bash
-PYTHON_BIN=.venv/bin/python \
-DEVICE=cuda \
-CONTEXT_CACHE_MODE=transient \
-bash benchmark/run_all_profiling.sh
-```
-
-Small dry run:
-
-```bash
-python -m benchmark.cli --preset full-pipeline \
-  --dry-run \
-  --device cpu \
-  --limb-min 1 --limb-max 1 \
-  --bootstrap-dnum-values 2 \
-  --bootstrap-logbs-values 12 \
-  --bootstrap-level-budgets 3,3 \
-  --bootstrap-target-limbs-max 17
-```
-
-## Generated Artifacts
-
-Most files under `data/` are generated benchmark outputs and should not be
-checked in.
+The plaintext-multiplication case also demonstrates the canonical on-GPU
+constant path: a slot-ready CUDA tensor is wrapped in `PackedRaw`, transformed
+to the CKKS middle representation on first use, and retained by
+`ConstantBundle(cache_mode="middle")`. Level-specific plaintext material is not
+kept resident.

@@ -1,0 +1,6 @@
+numpy
+datasets
+huggingface_hub
+safetensors
+transformers
+triton

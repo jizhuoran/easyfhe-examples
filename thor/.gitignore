@@ -1,0 +1,4 @@
+*.safetensors
+datasets/
+tokenizer/
+assets/

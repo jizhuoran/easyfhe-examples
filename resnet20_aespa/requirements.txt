@@ -1,2 +1,4 @@
 easyfhe
+huggingface_hub
 numpy
+triton
